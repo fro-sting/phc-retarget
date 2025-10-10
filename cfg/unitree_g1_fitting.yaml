@@ -41,8 +41,8 @@ joint_matches:
 
 
 smpl_pose_modifier:
-  - Pelvis: "[np.pi/2, 0, np.pi/2]"
-  - L_Shoulder: "[0, 0, -np.pi/2]"
-  - R_Shoulder: "[0, 0, np.pi/2]"
-  - L_Elbow: "[0, -np.pi/2, 0]"
-  - R_Elbow: "[0, np.pi/2, 0]"
+  Pelvis: "[np.pi/2, 0, np.pi/2]"
+  L_Shoulder: "[0, 0, -np.pi/2]"
+  R_Shoulder: "[0, 0, np.pi/2]"
+  L_Elbow: "[0, -np.pi/2, 0]"
+  R_Elbow: "[0, np.pi/2, 0]"
