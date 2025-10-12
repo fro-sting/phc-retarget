@@ -1,4 +1,4 @@
-Credit to [PHC](https://github.com/ZhengyiLuo/PHC)
+Credit to [PHC](https://github.com/ZhengyiLuo/PHC) and [simple-retarget](https://github.com/btx0424/simple-retarget)
 
 ## Installation
 Here we use `uv` to manage the environment, please make sure you have installed `uv` first.
@@ -35,20 +35,15 @@ First we need to fit the smpl shape to the humanoid robot:
 ```bash
 uv run scripts/1-fit_smpl_shape.py
 ```
-It will save the fitted smpl `beta` parameters and the corresponding `scale` parameters in the `data/g1_29dof/shape_optimized_v1.pkl` folder.
+It will save the fitted smpl `beta` parameters in the `g1_29dof_shape.npz` file.
 
 Then we need to fit the motion data to the humanoid robot:
 ```bash
-uv run scripts/2-fit_smpl_motion.py +amass_root=./data/AMASS
+uv run scripts/3-fit_smpl_motion_mp.py +motion_path=./data/AMASS +target_fps=30 +output_name=<motion_file>
 ```
-If you only have one motion file, it will save the fitted motion data in the `data/g1_29dof/v1/singles` folder.
-Otherwise, it will save the fitted motion data in the `data/g1_29dof/v1/amass_all.pkl`.
+It will save the fitted motion data in the `data/g1_29dof/<output_name>.pkl` file.
 
 Finally, we can visualize the fitted motion data:
 ```bash
-# for single motion file
-uv run scripts/3-vis_q_mj.py +motion_file=./data/g1_29dof/v1/singles/0005_Walking001_poses.pkl
-
-# for multiple motion files
-uv run scripts/3-vis_q_mj.py +motion_file=./data/g1_29dof/v1/amass_all.pkl
+uv run scripts/3-vis_q_mj.py +motion_file=./data/g1_29dof/<output_name>.pkl
 ```

@@ -1,230 +1,219 @@
-import glob
 import os
-import sys
-import pdb
-import os.path as osp
-os.environ["OMP_NUM_THREADS"] = "1"
-sys.path.append(os.getcwd())
-
-# handling numpy version mismatch
-import numpy as np
-
-from smpl_sim.utils import torch_utils
-from scipy.spatial.transform import Rotation as sRot
 import torch
-from smpl_sim.smpllib.smpl_parser import SMPL_Parser
-
-import joblib
-import torch
-from torch.autograd import Variable
-from tqdm import tqdm
-from smpl_sim.smpllib.smpl_joint_names import SMPL_BONE_ORDER_NAMES
-from utils.torch_humanoid_batch import Humanoid_Batch
-from smpl_sim.utils.smoothing_utils import gaussian_filter_1d_batch
+import torch.nn as nn
 import hydra
-from omegaconf import DictConfig
+import numpy as np
+import pytorch_kinematics as pk
+import xml.etree.ElementTree as ET
 
-def load_amass_data(data_path):
-    entry_data = dict(np.load(open(data_path, "rb"), allow_pickle=True))
+from smplx import SMPL
+from scipy.spatial.transform import Rotation as sRot
 
-    # mocap_framerate or mocap_frame_rate
-    if not 'mocap_framerate' in entry_data and not 'mocap_frame_rate' in entry_data:
-        return 
-    framerate = entry_data['mocap_framerate'] if 'mocap_framerate' in entry_data else entry_data['mocap_frame_rate']
+DATA_PATH = os.path.join(os.path.dirname(__file__), "../data")
+
+SMPL_BONE_ORDER_NAMES = [
+    "Pelvis",
+    "L_Hip",
+    "R_Hip",
+    "Torso",
+    "L_Knee",
+    "R_Knee",
+    "Spine",
+    "L_Ankle",
+    "R_Ankle",
+    "Chest",
+    "L_Toe",
+    "R_Toe",
+    "Neck",
+    "L_Thorax",
+    "R_Thorax",
+    "Head",
+    "L_Shoulder",
+    "R_Shoulder",
+    "L_Elbow",
+    "R_Elbow",
+    "L_Wrist",
+    "R_Wrist",
+    "L_Hand",
+    "R_Hand",
+]
 
 
-    root_trans = entry_data['trans']
-    pose_aa = np.concatenate([entry_data['poses'][:, :66], np.zeros((root_trans.shape[0], 6))], axis = -1)
-    betas = entry_data['betas']
-    gender = entry_data['gender']
-    N = pose_aa.shape[0]
-    return {
-        "pose_aa": pose_aa,
-        "gender": gender,
-        "trans": root_trans, 
-        "betas": betas,
-        "fps": framerate
-    }
-    
-def process_motion(key_names, key_name_to_pkls, cfg):
-    device = torch.device("cpu")
-    
-    humanoid_fk = Humanoid_Batch(cfg) # load forward kinematics model
-    num_augment_joint = len(cfg.extend_config) if "extend_config" in cfg else 0
+def build_chain(cfg) -> pk.Chain:
+    mjcf_path = cfg.asset.assetFileName
 
-    #### Define corresonpdances between h1 and smpl joints
-    robot_joint_names_augment = humanoid_fk.body_names_augment 
-    robot_joint_pick = [i[0] for i in cfg.joint_matches]
-    smpl_joint_pick = [i[1] for i in cfg.joint_matches]
-    robot_joint_pick_idx = [robot_joint_names_augment.index(j) for j in robot_joint_pick]
-    smpl_joint_pick_idx = [SMPL_BONE_ORDER_NAMES.index(j) for j in smpl_joint_pick]
-    
-    smpl_parser_n = SMPL_Parser(model_path="data/smpl", gender="neutral")
-    shape_new, scale = joblib.load(f"data/{cfg.humanoid_type}/shape_optimized_v1.pkl") # TODO: run fit_smple_shape to get this
-    
-    
-    all_data = {}
-    pbar = tqdm(key_names, position=0, leave=True)
-    for data_key in pbar:
-        amass_data = load_amass_data(key_name_to_pkls[data_key])
-        if amass_data is None: continue
-        skip = int(amass_data['fps']//30)
-        trans = torch.from_numpy(amass_data['trans'][::skip])
-        N = trans.shape[0]
-        pose_aa_walk = torch.from_numpy(amass_data['pose_aa'][::skip]).float()
+    tree = ET.parse(mjcf_path)
+    root = tree.getroot()
+
+    # remove the free joint of the base link
+    root_name = cfg.get("root_name", "pelvis")
+    root_body = root.find(f".//body[@name='{root_name}']")
+    root_joint = root.find(".//joint[@type='free']")
+    root_body.remove(root_joint)
+    root_body.set("pos", "0 0 0")
+
+    for extend_config in cfg.extend_config:
+        parent = root.find(f".//body[@name='{extend_config.parent_name}']")
+        if parent is None:
+            raise ValueError(f"Parent body {extend_config.parent_name} not found in MJCF")
         
-        if N < 10:
-            print("to short")
-            continue
+        pos = extend_config.pos
+        rot = extend_config.rot
+        # create and insert a dummy body with a fixed joint
+        body = ET.Element("body", name=extend_config.joint_name)
+        body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
+        body.set("quat", f"{rot[0]} {rot[1]} {rot[2]} {rot[3]}")
+        inertial = ET.Element("inertial", pos="0 0 0", quat="0 0 0 1", mass="0.1", diaginertia="0.1 0.1 0.1")
+        body.append(inertial)
+        parent.append(body)
 
-        with torch.no_grad():
-            verts, joints = smpl_parser_n.get_joints_verts(pose_aa_walk, shape_new, trans)
-            root_pos = joints[:, 0:1]
-            joints = (joints - joints[:, 0:1]) * scale.detach() + root_pos
-        joints[..., 2] -= verts[0, :, 2].min().item()
-        
-            
-        offset = joints[:, 0] - trans
-        root_trans_offset = (trans + offset).clone()
+    cwd = os.getcwd()
+    os.chdir(os.path.dirname(mjcf_path))
+    chain = pk.build_chain_from_mjcf(ET.tostring(root, method="xml"), body=root_name)
+    os.chdir(cwd)
+    return chain
 
-
-
-        gt_root_rot_quat = torch.from_numpy((sRot.from_rotvec(pose_aa_walk[:, :3]) * sRot.from_quat([0.5, 0.5, 0.5, 0.5]).inv()).as_quat()).float() # can't directly use this 
-        gt_root_rot = torch.from_numpy(sRot.from_quat(torch_utils.calc_heading_quat(gt_root_rot_quat)).as_rotvec()).float() # so only use the heading. 
-        
-        # def dof_to_pose_aa(dof_pos):
-        dof_pos = torch.zeros((1, N, humanoid_fk.num_dof, 1))
-
-        dof_pos_new = Variable(dof_pos.clone(), requires_grad=True)
-        root_rot_new = Variable(gt_root_rot.clone(), requires_grad=True)
-        root_pos_offset = Variable(torch.zeros(1, 3), requires_grad=True)
-        # optimizer_pose = torch.optim.Adam([dof_pos_new],lr=0.01)
-        # optimizer_root = torch.optim.Adam([root_rot_new, root_pos_offset],lr=0.01)
-        optimizer = torch.optim.Adam([dof_pos_new, root_rot_new, root_pos_offset],lr=0.02)
-
-
-        kernel_size = 5  # Size of the Gaussian kernel
-        sigma = 0.75  # Standard deviation of the Gaussian kernel
-        B, T, J, D = dof_pos_new.shape    
-
-        
-        for iteration in range(cfg.get("fitting_iterations", 500)):
-            pose_aa_h1_new = torch.cat([root_rot_new[None, :, None], humanoid_fk.dof_axis * dof_pos_new, torch.zeros((1, N, num_augment_joint, 3)).to(device)], axis = 2)
-            fk_return = humanoid_fk.fk_batch(pose_aa_h1_new, root_trans_offset[None, ] + root_pos_offset )
-            
-            
-            if num_augment_joint > 0:
-                diff = fk_return.global_translation_extend[:, :, robot_joint_pick_idx] - joints[:, smpl_joint_pick_idx]
-            else:
-                diff = fk_return.global_translation[:, :, robot_joint_pick_idx] - joints[:, smpl_joint_pick_idx]
-                
-            loss_g = diff.norm(dim = -1).mean() + 0.01 * torch.mean(torch.square(dof_pos_new))
-            loss = loss_g
-            
-            optimizer.zero_grad()
-            # optimizer_pose.zero_grad()
-            # optimizer_root.zero_grad()
-            loss.backward()
-            optimizer.step()
-            # optimizer_pose.step()
-            # optimizer_root.step()
-            
-            dof_pos_new.data.clamp_(humanoid_fk.joints_range[:, 0, None], humanoid_fk.joints_range[:, 1, None])
-
-            pbar.set_description_str(f"{data_key}-Iter: {iteration} \t {loss.item() * 1000:.3f}")
-            dof_pos_new.data = gaussian_filter_1d_batch(dof_pos_new.squeeze().transpose(1, 0)[None, ], kernel_size, sigma).transpose(2, 1)[..., None]
-            
-            # from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import
-            # import matplotlib.pyplot as plt
-            
-            # j3d = fk_return.global_translation[0, :, :, :].detach().numpy()
-            # j3d_joints = joints.detach().numpy()
-            # idx = 0
-            # fig = plt.figure()
-            # ax = fig.add_subplot(111, projection='3d')
-            # ax.view_init(90, 0)
-            # ax.scatter(j3d[idx, :,0], j3d[idx, :,1], j3d[idx, :,2])
-            # ax.scatter(j3d_joints[idx, :,0], j3d_joints[idx, :,1], j3d_joints[idx, :,2])
-
-            # ax.set_xlabel('X Label')
-            # ax.set_ylabel('Y Label')
-            # ax.set_zlabel('Z Label')
-            # drange = 1
-            # ax.set_xlim(-drange, drange)
-            # ax.set_ylim(-drange, drange)
-            # ax.set_zlim(-drange, drange)
-            # plt.show()
-            
-        dof_pos_new.data.clamp_(humanoid_fk.joints_range[:, 0, None], humanoid_fk.joints_range[:, 1, None])
-        pose_aa_h1_new = torch.cat([root_rot_new[None, :, None], humanoid_fk.dof_axis * dof_pos_new, torch.zeros((1, N, num_augment_joint, 3)).to(device)], axis = 2)
-
-        root_trans_offset_dump = (root_trans_offset + root_pos_offset ).clone()
-
-        # move to ground
-        # 1.using the lowest body pos in motion
-        # height_diff = fk_return.global_translation[..., 2].min().item() 
-
-        # 2.using the lowest point of mesh in motion
-        combined_mesh = humanoid_fk.mesh_fk(pose_aa_h1_new[:, :1].detach(), root_trans_offset_dump[None, :1].detach())
-        height_diff = np.asarray(combined_mesh.vertices)[..., 2].min()
-        
-        root_trans_offset_dump[..., 2] -= height_diff
-        joints_dump = joints.numpy().copy()
-        joints_dump[..., 2] -= height_diff
-        
-        data_dump = {
-                    "root_trans_offset": root_trans_offset_dump.squeeze().detach().numpy(),
-                    "pose_aa": pose_aa_h1_new.squeeze().detach().numpy(),   
-                    "dof": dof_pos_new.squeeze().detach().numpy(), 
-                    "root_rot": sRot.from_rotvec(root_rot_new.detach().numpy()).as_quat(),
-                    "smpl_joints": joints_dump, 
-                    "fps": 30
-                    }
-        all_data[data_key] = data_dump
-    return all_data
-        
 
 @hydra.main(version_base=None, config_path="../cfg", config_name="unitree_g1_fitting")
-def main(cfg : DictConfig) -> None:
-    if "amass_root" in cfg:
-        amass_root = cfg.amass_root
-    else:
-        raise ValueError("amass_root is not specified in the config")
-    
-    all_pkls = glob.glob(f"{amass_root}/**/*.npz", recursive=True)
-    split_len = len(amass_root.split("/"))
-    key_name_to_pkls = {"0-" + "_".join(data_path.split("/")[split_len:]).replace(".npz", ""): data_path for data_path in all_pkls}
-    key_names = ["0-" + "_".join(data_path.split("/")[split_len:]).replace(".npz", "") for data_path in all_pkls]
+def main(cfg):
+    chain = build_chain(cfg)
+    chain.forward_kinematics(torch.zeros(1, chain.n_joints))
 
-    # multiprocessing
-    from multiprocessing import Pool
-    jobs = key_names
-    num_jobs = 8
-    chunk = np.ceil(len(jobs)/num_jobs).astype(int)
-    jobs= [jobs[i:i + chunk] for i in range(0, len(jobs), chunk)]
-    job_args = [(jobs[i], key_name_to_pkls, cfg) for i in range(len(jobs))]
-    if len(job_args) == 1:
-        all_data = process_motion(key_names, key_name_to_pkls, cfg)
-    else:
-        try:
-            pool = Pool(num_jobs)   # multi-processing
-            all_data_list = pool.starmap(process_motion, job_args)
-        except KeyboardInterrupt:
-            pool.terminate()
-            pool.join()
-        all_data = {}
-        for data_dict in all_data_list:
-            all_data.update(data_dict)
-    # import ipdb; ipdb.set_trace()
-    if len(all_data) == 1:
-        data_key = list(all_data.keys())[0]
-        os.makedirs(f"data/{cfg.humanoid_type}/v1/singles", exist_ok=True)
-        dumped_file = f"data/{cfg.humanoid_type}/v1/singles/{data_key}.pkl"
-        print(dumped_file)
-        joblib.dump(all_data, dumped_file)
-    else:
-        os.makedirs(f"data/{cfg.humanoid_type}/v1/", exist_ok=True)
-        joblib.dump(all_data, f"data/{cfg.humanoid_type}/v1/amass_all.pkl")
+    motion_path = os.path.join(DATA_PATH, "AMASS/SFU/0005/0005_Walking001_poses.npz")
+
+    with open(motion_path, "rb") as f:
+        motion = dict(np.load(f))
+    
+    T = motion["poses"].shape[0]
+    motion["poses"] = motion["poses"][:, :66].reshape(T, 22, 3)
+    body_pose = torch.as_tensor(motion["poses"][:, 1:], dtype=torch.float32)
+    hand_pose = torch.zeros(T, 2, 3)
+    data = {
+        "body_pose": torch.cat([body_pose, hand_pose], dim=1),
+        "global_orient": torch.as_tensor(motion["poses"][:, 0], dtype=torch.float32),
+        "trans": torch.as_tensor(motion["trans"], dtype=torch.float32),
+    }
+
+    body_model = SMPL(model_path=os.path.join(DATA_PATH, "smpl"), gender="neutral")
+
+    path = os.path.join(os.path.dirname(__file__), f"{cfg.humanoid_type}_shape.npz")
+    fitted_shape = torch.from_numpy(np.load(path)["betas"])
+
+    with torch.no_grad():
+        result = body_model.forward(
+            fitted_shape,
+            body_pose=data["body_pose"].reshape(T, 69),
+            global_orient=data["global_orient"],
+            transl=data["trans"]
+        )
+    
+    # which joints to match
+    robot_body_names = []
+    smpl_joint_idx = []
+    for robot_body_name, smpl_joint_name in cfg.joint_matches:
+        robot_body_names.append(robot_body_name)
+        smpl_joint_idx.append(SMPL_BONE_ORDER_NAMES.index(smpl_joint_name))
+
+    # since the betas are changed and so are the SMPL body morphology,
+    # we need to make some corrections to avoid ground pentration
+    ground_offset = result.vertices[:, :, 2].min()
+    smpl_keypoints = result.joints[:, smpl_joint_idx] - ground_offset
+
+    robot_rot = sRot.from_rotvec(data["global_orient"]) * sRot.from_euler("xyz", [np.pi/2, 0., np.pi/2]).inv()
+    robot_rotmat = torch.as_tensor(robot_rot.as_matrix(), dtype=torch.float32)
+
+    robot_th = torch.nn.Parameter(torch.zeros(T, chain.n_joints))        
+    robot_trans = torch.nn.Parameter(data["trans"].clone() - ground_offset)
+    opt = torch.optim.Adam([robot_th, robot_trans], lr=0.02)
+
+    indices = chain.get_all_frame_indices()
+    
+    def get_robot_keypoints(th: torch.Tensor, trans: torch.Tensor):
+        body_pos = chain.forward_kinematics(th, indices) # in robot's root frame
+        robot_keypoints = torch.stack([
+            body_pos[name].get_matrix()[:, :3, 3]
+            for name in robot_body_names
+        ], dim=1)
+        # convert to world frame
+        robot_keypoints = robot_rotmat.unsqueeze(1) @ robot_keypoints.unsqueeze(-1)
+        robot_keypoints = robot_keypoints.squeeze(-1) + trans.unsqueeze(1)
+        return robot_keypoints
+        
+    for i in range(300):
+        robot_keypoints = get_robot_keypoints(robot_th, robot_trans)
+        loss = nn.functional.mse_loss(robot_keypoints, smpl_keypoints)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if i % 10 == 0:
+            print(f"iter {i}, loss {100 * loss.item():.3f}")
+    
+    with torch.no_grad():
+        robot_keypoints = get_robot_keypoints(robot_th, robot_trans)
+    
+    motion_name = motion_path.split("/")[-1].split(".")[0]
+    save_path = f"{motion_name}.pt"
+    data = {
+        "joint_pos": robot_th.data.numpy(),
+        "keypoint_pos_w": robot_keypoints.data.numpy(),
+        "root_pos_w": robot_trans.data.numpy(),
+        "root_quat_w": robot_rot.as_quat(),
+    }
+    print(f"Saving to {save_path}")
+    np.savez_compressed(save_path, **data)
+
+    def init_mesh(vertices, color=[0.3, 0.3, 0.3]):
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(vertices)
+        mesh.triangles = o3d.utility.Vector3iVector(body_model.faces)
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color(color)
+        return mesh
+    
+    import open3d as o3d
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    mesh = init_mesh(result.vertices[0])
+    vis.add_geometry(mesh)
+
+    plane = o3d.geometry.TriangleMesh.create_box(4., 4., 0.01)
+    plane.translate([-2., -2., -0.005])
+    plane.compute_vertex_normals()
+    vis.add_geometry(plane)
+
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame()
+    frame.compute_vertex_normals()
+    vis.add_geometry(frame)
+
+    robot_pcd = o3d.geometry.PointCloud()
+    robot_pcd.points = o3d.utility.Vector3dVector(robot_keypoints[0])
+    robot_pcd.colors = o3d.utility.Vector3dVector(torch.tensor([0, 0, 1]).expand_as(robot_keypoints[0]))
+    vis.add_geometry(robot_pcd)
+
+    smpl_pcd = o3d.geometry.PointCloud()
+    smpl_pcd.points = o3d.utility.Vector3dVector(result.joints[0, smpl_joint_idx])
+    smpl_pcd.colors = o3d.utility.Vector3dVector(torch.tensor([1, 0, 0]).expand_as(result.joints[0, smpl_joint_idx]))
+    vis.add_geometry(smpl_pcd)
+
+    opt = vis.get_render_option()
+    # Set the point size
+    point_size = 10.0  # You can adjust this value according to your needs
+    opt.point_size = point_size
+
+    for t in range(T):
+        mesh.vertices = o3d.utility.Vector3dVector(result.vertices[t]-ground_offset)
+        # mesh.compute_vertex_normals()
+        # vis.update_geometry(mesh)
+
+        robot_pcd.points = o3d.utility.Vector3dVector(robot_keypoints[t])
+        vis.update_geometry(robot_pcd)
+
+        smpl_pcd.points = o3d.utility.Vector3dVector(smpl_keypoints[t])
+        vis.update_geometry(smpl_pcd)
+
+        vis.poll_events()
+        vis.update_renderer()
     
 
 
