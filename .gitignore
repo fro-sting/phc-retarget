@@ -55,7 +55,7 @@ logs/
 temp/
 
 # Large data files
-# data/AMASS/
+data/AMASS/Transitions/
 data/g1_29dof/
 data/smpl/
 

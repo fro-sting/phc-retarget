@@ -196,13 +196,17 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         # convert to world frame
         robot_keypoints_w = robot_trans.unsqueeze(1) + mat_rotate(robot_rotmat.unsqueeze(1), robot_keypoints_b)
 
+        omega = torch.gradient(robot_th, spacing=1/cfg.target_fps, dim=0)[0]    # [T, J]
+        
         violate_low  = torch.relu(low  - robot_th)
         violate_high = torch.relu(robot_th - high)
         L_limit = (violate_low**2 + violate_high**2).mean()
 
-        omega = torch.gradient(robot_th, spacing=1/cfg.target_fps, dim=0)[0]    # [T, J]
-
-        loss = nn.functional.mse_loss(robot_keypoints_w, smpl_keypoints_w) + 1e-2 * torch.mean(torch.square(robot_th)) + 1e-3 * torch.mean(torch.square(omega)) + 1e2 * L_limit
+        keypoints_pos_error = nn.functional.mse_loss(robot_keypoints_w, smpl_keypoints_w)
+        joint_pos_reg = 1e-2 * torch.mean(torch.square(robot_th))
+        joint_vel_reg = 1e-3 * torch.mean(torch.square(omega))
+        joint_limit_reg = 1e2 * L_limit
+        loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
         opt.zero_grad()
         loss.backward()
         opt.step()
