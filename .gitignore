@@ -58,10 +58,9 @@ temp/
 data/AMASS/Transitions/
 data/g1_29dof/
 data/smpl/
-data/
+data/Transitions
 # Pickle files
 # *.pkl
 
 homework.md
 
-*.npz
