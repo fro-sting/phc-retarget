@@ -212,6 +212,8 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         opt.step()
         # if i % 10 == 0:
         #     print(f"iter {i}, loss {100 * loss.item():.3f}")
+        if i % 490 == 0:
+            print(f"iter {i}, loss {100 * loss.item():.3f}, keypoint_error {100 * keypoints_pos_error.item():.3f}, joint_limit_violation {L_limit.item():.6f}")
 
     with torch.no_grad():
         robot_keypoints_b = torch.stack([
