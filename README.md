@@ -41,9 +41,19 @@ Then we need to fit the motion data to the humanoid robot:
 ```bash
 uv run scripts/3-fit_smpl_motion_mp.py +motion_path=./data/AMASS +target_fps=30 +output_name=<motion_file>
 ```
+fit motion with quat
+```bash
+uv run scripts/3-withquat.py +motion_path=./data/AMASS +target_fps=30 +output_name=<motion_file>
+```
+
 It will save the fitted motion data in the `data/g1_29dof/<output_name>.pkl` file.
 
 Finally, we can visualize the fitted motion data:
 ```bash
-uv run scripts/3-vis_q_mj.py +motion_file=./data/g1_29dof/<output_name>.pkl
+uv run scripts/4-vis_mj.py +motion_file=./data/g1_29dof/<output_name>.pkl
+```
+
+find orit offset
+```bash
+uv run 5-findoffset.py
 ```
