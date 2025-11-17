@@ -8,6 +8,7 @@ import pytorch_kinematics as pk
 import xml.etree.ElementTree as ET
 import multiprocessing as mp
 import joblib
+from isaaclab.utils.math import quat_mul, quat_error_magnitude
 
 from smplx import SMPL
 from scipy.spatial.transform import Rotation as sRot, Slerp
@@ -103,65 +104,6 @@ def slerp(x, xp, fp):
     s = Slerp(xp, sRot.from_rotvec(fp))
     return s(x).as_rotvec()
 
-def rodrigues(axis_angle: torch.Tensor) -> torch.Tensor:
-    """
-    Converts axis-angle representation to rotation matrix using Rodrigues' rotation formula.
-    axis_angle: [N, 3]
-    Returns: [N, 3, 3]
-    """
-    N = axis_angle.shape[0]
-    device = axis_angle.device
-    dtype = axis_angle.dtype
-    
-    theta = torch.norm(axis_angle, p=2, dim=1, keepdim=True) 
-
-    I = torch.eye(3, device=device, dtype=dtype).expand(N, 3, 3)
-
-    mask = (theta > 1e-8).squeeze() # [N]
-
-    R = I.clone()
-    
-    if not mask.any():
-        return R
-
-    aa_non_zero = axis_angle[mask]
-    theta_non_zero = theta[mask].unsqueeze(-1) # [N_non_zero, 1, 1]
-
-    k = aa_non_zero / theta_non_zero.squeeze(-1) # [N_non_zero, 3]
-
-    K = torch.zeros((k.shape[0], 3, 3), device=device, dtype=dtype)
-    K[:, 0, 1] = -k[:, 2]
-    K[:, 0, 2] = k[:, 1]
-    K[:, 1, 0] = k[:, 2]
-    K[:, 1, 2] = -k[:, 0]
-    K[:, 2, 0] = -k[:, 1]
-    K[:, 2, 1] = k[:, 0]
-    
-    sin_theta = torch.sin(theta_non_zero)
-    cos_theta = torch.cos(theta_non_zero)
-    # R = I + sin(theta)K + (1 - cos(theta))K^2
-    R_non_zero = I[mask] + K * sin_theta + torch.matmul(K, K) * (1.0 - cos_theta)
-
-    R[mask] = R_non_zero
-    
-    return R
-def rotation_matrix_distance(R1, R2):
-    """
-    Calculates the geodesic distance (angle) between two batches of rotation matrices.
-    R1, R2: [..., 3, 3]
-    Returns: [...,]
-    """
-    R_rel = torch.matmul(R1.transpose(-1, -2), R2)
-    
-    # Trace
-    tr = torch.einsum('...ii->...', R_rel)
-    # cos(theta) = (Trace(R) - 1) / 2
-    cos_theta = (tr - 1) / 2
-
-    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-
-    return torch.acos(cos_theta)
-
 
 def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
     
@@ -224,27 +166,34 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
 
     
    
-    full_pose_aa = result.full_pose
-    #print(f"Full pose shape: {full_pose_aa.shape}")
+    full_pose_aa = result.full_pose  # [T, 72]
     T = full_pose_aa.shape[0]
-    full_pose_aa_flat = full_pose_aa.view(-1, 3)
-    smpl_local_mats_flat = rodrigues(full_pose_aa_flat)
-    smpl_local_mats = smpl_local_mats_flat.view(T, 24, 3, 3)
-
-    parents = body_model.parents
     
-    #compute global matrices
-    smpl_global_mats_w = torch.zeros_like(smpl_local_mats)
-    smpl_global_mats_w[:, 0] = smpl_local_mats[:, 0]
+    full_pose_aa = full_pose_aa.reshape(T, 24, 3)
+    full_pose_aa_np = full_pose_aa.numpy()  # [T, 24, 3]
+    
+    # convert axis-angle to quaternions
+    smpl_local_quats = np.zeros((T, 24, 4), dtype=np.float32)
+    for t in range(T):
+        frame_pose = full_pose_aa_np[t]  # [24, 3]
+        rotations = sRot.from_rotvec(frame_pose)  
+        smpl_local_quats[t] = rotations.as_quat(scalar_first=True)  # [24, 4]
+    
+    smpl_local_quats = torch.as_tensor(smpl_local_quats, dtype=torch.float32)
+    
+    parents = body_model.parents
+
+    # compute global quaternions
+    smpl_global_quats = torch.zeros(T, 24, 4, dtype=torch.float32)
+    smpl_global_quats[:, 0] = smpl_local_quats[:, 0]
     for i in range(1, 24):
         parent_idx = parents[i]
-        smpl_global_mats_w[:, i] = torch.matmul(
-            smpl_global_mats_w[:, parent_idx],
-            smpl_local_mats[:, i]
+        smpl_global_quats[:, i] = quat_mul(
+            smpl_global_quats[:, parent_idx],
+            smpl_local_quats[:, i]
         )
-
     # apply orientation offsets
-    smpl_global_mats_modified = smpl_global_mats_w.clone()
+    smpl_global_quats_modified = smpl_global_quats.clone()
     for joint_name, quat in cfg.quat_offset.items():
         joint_idx = SMPL_BONE_ORDER_NAMES.index(joint_name)
         
@@ -253,16 +202,12 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
             quat_str = quat.strip('[]')
             quat = [float(x.strip()) for x in quat_str.split(',')]
         
-        # transform to rotation matrix
-        rot = sRot.from_quat(quat, scalar_first=True)
-        rot_mat = torch.as_tensor(rot.as_matrix(), dtype=torch.float32)
-        #print(f"Applying quat offset to joint {joint_name} (index {joint_idx}): quat={quat}\nrot_mat=\n{rot_mat.cpu().numpy()}")
-
-        smpl_global_mats_modified[:, joint_idx] = torch.matmul(
-            smpl_global_mats_w[:, joint_idx],
-            rot_mat
-        )
-        
+        quat_offset = torch.as_tensor(quat, dtype=torch.float32)  # [4]
+        for t in range(T):
+            smpl_global_quats_modified[t, joint_idx] = quat_mul(
+                smpl_global_quats[t, joint_idx:joint_idx+1],
+                quat_offset.unsqueeze(0)
+            ).squeeze(0)
 
     # which joints to match
     robot_body_names = []
@@ -271,7 +216,7 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         robot_body_names.append(robot_body_name)
         smpl_joint_idx.append(SMPL_BONE_ORDER_NAMES.index(smpl_joint_name))
     
-    smpl_target_mats = smpl_global_mats_modified[:, smpl_joint_idx]
+    smpl_target_mats = smpl_global_quats_modified[:, smpl_joint_idx]
    
    #print(f"joint_idx={smpl_joint_idx}   robot_body_names={robot_body_names}")
 
@@ -310,12 +255,11 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
             for name in robot_body_names
         ], dim=1) # Shape: [T, N, 3, 3]
         robot_orient_mats_w = torch.matmul(robot_rotmat.unsqueeze(1), robot_orient_mats_b)
-        orient_angle_error = rotation_matrix_distance(robot_orient_mats_w, smpl_target_mats)
-        orientation_error = torch.mean(torch.square(orient_angle_error))
 
-        joint_orient_errors = torch.mean(torch.square(orient_angle_error), dim=0)  # [N]
-
-
+        robot_quats_w = pk.matrix_to_quaternion(robot_orient_mats_w)
+        
+        quat_error = quat_error_magnitude(robot_quats_w, smpl_global_quats_modified[:, smpl_joint_idx])  # [T, N]
+        
         omega = torch.gradient(robot_th, spacing=1/cfg.target_fps, dim=0)[0]    # [T, J]
         
         violate_low  = torch.relu(low  - robot_th)
@@ -325,11 +269,11 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         keypoints_pos_error = nn.functional.mse_loss(robot_keypoints_w, smpl_keypoints_w)
         joint_pos_reg = 1e-2 * torch.mean(torch.square(robot_th))
         joint_vel_reg = 1e-3 * torch.mean(torch.square(omega))
-        orientation_reg = 1e-1 * orientation_error
+        orientation_error = 1e-2 * torch.mean(torch.square(quat_error))  # 转为标量
         joint_limit_reg = 1e2 * L_limit
 
-        loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg + orientation_reg
-        #loss = joint_pos_reg + joint_vel_reg + joint_limit_reg + orientation_reg
+        loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg + orientation_error
+        #loss = joint_pos_reg + joint_vel_reg + joint_limit_reg + orientation_error
         #loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
         
 
@@ -337,8 +281,8 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         opt.zero_grad()
         loss.backward()
         opt.step()
-        # if i % 10 == 0:
-        #     print(f"iter {i}, loss {100 * loss.item():.3f}")
+        if i % 490 == 0:
+            print(f"iter {i}, loss {100 * loss.item():.3f} quat_err {100 * orientation_error:.3f} pos_err {100 * keypoints_pos_error.item():.3f} limit_err {100 * L_limit.item():.3f}")
 
     with torch.no_grad():
         robot_keypoints_b = torch.stack([
