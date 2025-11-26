@@ -104,20 +104,6 @@ def slerp(x, xp, fp):
     s = Slerp(xp, sRot.from_rotvec(fp))
     return s(x).as_rotvec()
 
-def safe_quat_diff_loss(q1, q2):
-    """
-    计算四元数距离，避免 acos(1) 的梯度爆炸问题。
-    Loss = 1 - |q1 · q2|
-    当 q1 和 q2 完全相同时，Loss = 0，梯度平滑。
-    """
-    # 计算点积
-    dot = torch.sum(q1 * q2, dim=-1)
-    # 取绝对值（因为 q 和 -q 代表相同的旋转）
-    abs_dot = torch.abs(dot)
-    # 限制数值范围防止浮点误差超过 1.0 (虽然 1-abs_dot 自身很安全，但为了严谨)
-    abs_dot = torch.clamp(abs_dot, max=1.0)
-    return 1.0 - abs_dot
-
 
 def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
     
@@ -177,9 +163,7 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
             transl=data["trans"],
             return_full_pose=True
         )
-
-    
-   
+       
     full_pose_aa = result.full_pose  # [T, 72]
     T = full_pose_aa.shape[0]
     
@@ -232,10 +216,7 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
     
     smpl_target_mats = smpl_global_quats_modified[:, smpl_joint_idx]
    
-   #print(f"joint_idx={smpl_joint_idx}   robot_body_names={robot_body_names}")
-
-
-    
+    #print(f"joint_idx={smpl_joint_idx}   robot_body_names={robot_body_names}")   
 
     # since the betas are changed and so are the SMPL body morphology,
     # we need to make some corrections to avoid ground pentration
@@ -247,7 +228,7 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
     root_quat_init = torch.as_tensor(robot_rot.as_quat(scalar_first=True), dtype=torch.float32)
     
     robot_rotmat = torch.as_tensor(robot_rot.as_matrix(), dtype=torch.float32)
-    print("robot_rotmat:", robot_rotmat.shape)
+
     robot_root_quat = torch.nn.Parameter(root_quat_init.clone())
 
     robot_th = torch.nn.Parameter(torch.zeros(T, chain.n_joints))        
@@ -260,44 +241,31 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         return (rotmat @ v.unsqueeze(-1)).squeeze(-1)
 
     for i in range(500):
-        
         root_quat_norm = robot_root_quat / (torch.norm(robot_root_quat, dim=-1, keepdim=True) + 1e-9)
-
         robot_rotmat_opt = pk.quaternion_to_matrix(root_quat_norm)  # [T, 3, 3]
-        if i == 50:
-            print("robot_rotmat_opt:", robot_rotmat_opt[2])
-            print("robot_rotmat:", robot_rotmat[2])
+        
+    
         fk_output = chain.forward_kinematics(robot_th, indices) # in robot's root frame
         robot_keypoints_b = torch.stack([
             fk_output[name].get_matrix()[:, :3, 3]
             for name in robot_body_names
         ], dim=1)        
-        # convert to world frame
+        
         robot_keypoints_w = robot_trans.unsqueeze(1) + mat_rotate(robot_rotmat_opt.unsqueeze(1), robot_keypoints_b)
+        
         robot_orient_mats_b = torch.stack([
             fk_output[name].get_matrix()[:, :3, :3]
             for name in robot_body_names
-        ], dim=1) # Shape: [T, N, 3, 3]
-        # 这里用优化后的根旋转就会梯度爆炸
-        robot_orient_quats_b = pk.matrix_to_quaternion(robot_orient_mats_b)  # [T, N, 4]
-        N = len(robot_body_names)
-        # 2. 根节点四元数
-        robot_root_quat_expanded = root_quat_norm.unsqueeze(1).expand(T, N, 4)
-        # 3. 四元数乘法
-        robot_orient_quats_w = quat_mul(
-            robot_root_quat_expanded,  # [T, N, 4]
-            robot_orient_quats_b       # [T, N, 4]
-        )
-        robot_orient_quats_w = robot_orient_quats_w / (torch.norm(robot_orient_quats_w, dim=-1, keepdim=True) + 1e-9)
-
-        quat_error = quat_error_magnitude(robot_orient_quats_w, smpl_global_quats_modified[:, smpl_joint_idx])  # [T, N]
+        ], dim=1) 
         
+        robot_orient_mats_w = torch.matmul(robot_rotmat_opt.unsqueeze(1), robot_orient_mats_b)
+
+        robot_quats_w = pk.matrix_to_quaternion(robot_orient_mats_w)
+        robot_quats_w = robot_quats_w / (torch.norm(robot_quats_w, dim=-1, keepdim=True) + 1e-9)
+                
+        quat_error = quat_error_magnitude(robot_quats_w, smpl_global_quats_modified[:, smpl_joint_idx])  # [T, N]
+                
         omega = torch.gradient(robot_th, spacing=1/cfg.target_fps, dim=0)[0]    # [T, J]
-        #加入这几个项也会梯度爆炸
-        root_quat_reg_term = safe_quat_diff_loss(root_quat_norm, root_quat_init)
-        root_quat_reg = 1e-2 * torch.mean(root_quat_reg_term) # 稍微调大权重，因为 Loss 值变小了
-        root_quat_vel = torch.gradient(root_quat_norm, spacing=1/cfg.target_fps, dim=0)[0]
-        root_vel_reg = 1e-4 * torch.mean(torch.square(root_quat_vel))
         
         violate_low  = torch.relu(low  - robot_th)
         violate_high = torch.relu(robot_th - high)
@@ -306,36 +274,34 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         keypoints_pos_error = nn.functional.mse_loss(robot_keypoints_w, smpl_keypoints_w)
         joint_pos_reg = 1e-2 * torch.mean(torch.square(robot_th))
         joint_vel_reg = 1e-3 * torch.mean(torch.square(omega))
-        orientation_error = 1e-3 * torch.mean(torch.square(quat_error))  
+        orientation_error = 1e-2 * torch.mean(torch.square(quat_error))  
         joint_limit_reg = 1e2 * L_limit
 
-        orientation_loss_term = safe_quat_diff_loss(robot_orient_quats_w, smpl_global_quats_modified[:, smpl_joint_idx])
-        orientation_error = 2.0 * 1e-3 * torch.mean(orientation_loss_term)
-        # loss = (keypoints_pos_error + joint_pos_reg + joint_vel_reg + 
-        #         joint_limit_reg + orientation_error  )        #loss = joint_pos_reg + joint_vel_reg + joint_limit_reg + orientation_error
-        #loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
+        if i < 20:
+            # first stage (0-19): only position loss, without this stage the optimization often Collapse
+            orientation_error = torch.tensor(0.0)
+            loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg            
+        
+        elif i < 500:
+            # second stage (200-399): add orientation loss with small weight
+            orientation_error = 1e-2* torch.mean(torch.square(quat_error))
+            loss = (keypoints_pos_error + joint_pos_reg + joint_vel_reg + 
+                    joint_limit_reg + orientation_error)
+        if i == 490:
+            print(f"iter {i}, loss {100 * loss.item():.3f}, keypoint_error {100 * keypoints_pos_error.item():.3f}, orientation_error {100 * orientation_error.item():.3f}")
+            
         loss = (keypoints_pos_error + joint_pos_reg + joint_vel_reg + 
-                joint_limit_reg + orientation_error + root_quat_reg + root_vel_reg)
-
-
+                joint_limit_reg + orientation_error)
+        
         opt.zero_grad()
-        loss.backward()
+        loss.backward()        
         opt.step()
 
-        with torch.no_grad():
-            robot_root_quat.data.div_(
-                torch.norm(robot_root_quat.data, dim=-1, keepdim=True) + 1e-9
-            )
-        if i % 450 == 0:
-            print(f"iter {i}, loss {100 * loss.item():.3f} quat_err {100 * orientation_error:.3f} pos_err {100 * keypoints_pos_error.item():.3f} limit_err {100 * L_limit.item():.3f}")
-            print(f"root_quat_reg: {root_quat_reg.item():.6f}, root_vel_reg: {root_vel_reg.item():.6f}")
     with torch.no_grad():
         robot_rotmat_final = pk.quaternion_to_matrix(robot_root_quat)
-    
-        # 重新做一次FK,确保使用最新的robot_th
+
         fk_output = chain.forward_kinematics(robot_th, indices)
-        
-        # 获取所有链接的位置
+
         robot_keypoints_b = torch.stack([
             fk_output[name].get_matrix()[:, :3, 3]
             for name in chain.get_link_names()
@@ -351,7 +317,7 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         "fps": int(cfg.target_fps),
         "joint_pos": robot_th.data.numpy(),
         "root_pos_w": robot_trans.data.numpy(),
-        "root_quat_w": final_robot_rot.as_quat(),  # ✅ 优化后的根旋转 (x,y,z,w)
+        "root_quat_w": final_robot_rot.as_quat(),  
         "body_pos_w": robot_keypoints_w.data.numpy(),
         "body_pos_b": robot_keypoints_b.data.numpy(),
     }
@@ -396,4 +362,4 @@ def main(cfg):
     joblib.dump(all_data, f"data/{cfg.humanoid_type}/{cfg.output_name}.pkl")
 
 if __name__ == "__main__":
-    main()
+    main()  
